@@ -18,8 +18,8 @@ from hk_bus_eta import HKEta
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-MAX_RESULTS = 8          # Max routes/stops to show
-MAX_ETAS_PER_STOP = 3    # Max ETAs to display per stop
+MAX_RESULTS = 8
+MAX_ETAS_PER_STOP = 3
 # ============================================
 
 logging.basicConfig(
@@ -30,10 +30,20 @@ logger = logging.getLogger(__name__)
 
 # Global data
 hketa: HKEta = None
-# Reverse index: stop_name_lower -> List[(route_id, seq, company)]
 stop_to_routes: Dict[str, List[Tuple[str, int, str]]] = defaultdict(list)
-# stop_id -> (zh_name, en_name)
 stop_names: Dict[str, Tuple[str, str]] = {}
+
+# Short ID mapping (Telegram callback_data is limited to 64 bytes)
+route_id_map: Dict[str, str] = {}
+stop_id_map: Dict[str, str] = {}
+_next_id = 1
+
+def get_short_id(full_id: str, mapping: dict) -> str:
+    global _next_id
+    short = str(_next_id)
+    mapping[short] = full_id
+    _next_id += 1
+    return short
 
 def build_reverse_index():
     """Build stop name → routes reverse index on startup."""
@@ -48,7 +58,6 @@ def build_reverse_index():
         if not co_list:
             continue
 
-        # Use the first company as the primary one for stop lookup
         company = co_list[0]
         stops = route.get("stops", {}).get(company, [])
 
@@ -63,7 +72,6 @@ def build_reverse_index():
             if stop_id not in stop_names:
                 stop_names[stop_id] = (name_zh, name_en)
 
-            # Index both Chinese and English names
             for name in (name_zh, name_en):
                 if name:
                     key = name.lower()
@@ -78,7 +86,6 @@ def format_eta(eta_dict: dict) -> str:
     co = eta_dict.get("co", "").upper()
 
     try:
-        # Try to parse and show minutes remaining
         dt = datetime.fromisoformat(eta_str.replace("Z", "+00:00"))
         now = datetime.now(dt.tzinfo)
         mins = max(0, int((dt - now).total_seconds() // 60))
@@ -105,7 +112,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query_lower = query.lower()
 
-    # 1. Try exact / partial route number match first
+    # Route number match
     matching_routes = []
     for rid in hketa.route_list:
         route_num = hketa.route_list[rid].get("route", "")
@@ -118,9 +125,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_routes(update, matching_routes, query)
         return
 
-    # 2. Stop name search (using reverse index)
+    # Stop name search
     matching_stops = set()
-    for name_key, entries in stop_to_routes.items():
+    for name_key in stop_to_routes:
         if query_lower in name_key:
             matching_stops.add(name_key)
         if len(matching_stops) >= MAX_RESULTS:
@@ -143,10 +150,12 @@ async def show_routes(update: Update, route_ids: List[str], query: str):
         co = "/".join(route.get("co", [])).upper()
 
         lines.append(f"• {route.get('route')} {orig} → {dest} [{co}]")
+
+        short_id = get_short_id(rid, route_id_map)
         keyboard.append([
             InlineKeyboardButton(
                 f"{route.get('route')} {orig[:8]}→{dest[:8]}",
-                callback_data=f"route:{rid}"
+                callback_data=f"r:{short_id}"
             )
         ])
 
@@ -163,7 +172,6 @@ async def show_stops(update: Update, name_keys: List[str], query: str):
         if not entries:
             continue
 
-        # Pick the first occurrence to get a representative stop_id
         route_id, seq, company = entries[0]
         stops = hketa.route_list[route_id].get("stops", {}).get(company, [])
         if seq >= len(stops):
@@ -176,8 +184,10 @@ async def show_stops(update: Update, name_keys: List[str], query: str):
         zh, en = stop_names.get(stop_id, (name_key, name_key))
         display = zh or en
         lines.append(f"• {display}")
+
+        short_id = get_short_id(stop_id, stop_id_map)
         keyboard.append([
-            InlineKeyboardButton(display, callback_data=f"stop:{stop_id}")
+            InlineKeyboardButton(display, callback_data=f"s:{short_id}")
         ])
 
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -188,12 +198,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data
-    if data.startswith("route:"):
-        route_id = data.split(":", 1)[1]
-        await show_route_etas(query, route_id)
-    elif data.startswith("stop:"):
-        stop_id = data.split(":", 1)[1]
-        await show_stop_etas(query, stop_id)
+    if data.startswith("r:"):
+        short_id = data.split(":", 1)[1]
+        route_id = route_id_map.get(short_id)
+        if route_id:
+            await show_route_etas(query, route_id)
+    elif data.startswith("s:"):
+        short_id = data.split(":", 1)[1]
+        stop_id = stop_id_map.get(short_id)
+        if stop_id:
+            await show_stop_etas(query, stop_id)
 
 async def show_route_etas(query, route_id: str):
     route = hketa.route_list.get(route_id)
@@ -209,7 +223,6 @@ async def show_route_etas(query, route_id: str):
 
     lines = [f"{route.get('route')} {orig} → {dest}\n"]
 
-    # Show first 6 stops with ETAs (to avoid too long message)
     for seq in range(min(6, len(stops))):
         stop_id = stops[seq]
         zh, en = stop_names.get(stop_id, ("", ""))
@@ -219,7 +232,7 @@ async def show_route_etas(query, route_id: str):
             etas = hketa.getEtas(route_id=route_id, seq=seq, language="zh")
             eta_texts = [format_eta(e) for e in etas[:MAX_ETAS_PER_STOP]]
             eta_str = " | ".join(eta_texts) if eta_texts else "暫無資料"
-        except Exception as e:
+        except Exception:
             eta_str = "查詢失敗"
 
         lines.append(f"{seq+1}. {stop_name}\n   {eta_str}")
@@ -236,15 +249,13 @@ async def show_stop_etas(query, stop_id: str):
 
     lines = [f"站點：{stop_name}\n"]
 
-    # Find all routes that stop here
     found = []
-    for name_key, entries in stop_to_routes.items():
+    for entries in stop_to_routes.values():
         for route_id, seq, company in entries:
             stops = hketa.route_list.get(route_id, {}).get("stops", {}).get(company, [])
             if seq < len(stops) and stops[seq] == stop_id:
                 found.append((route_id, seq, company))
 
-    # Deduplicate
     unique = list({(r, s, c) for r, s, c in found})[:12]
 
     if not unique:
